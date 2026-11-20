@@ -1,178 +1,270 @@
-"""Your app. Replace this with whatever you are building.
+"""Walk Home Check: recorded street crime along a walk, and whether it is dark.
 
-The shape never changes, whatever your app does:
-
-    class App:
-        manifest  -> the parsed manifest.yaml sitting next to this file
-        handle(call) -> Result
-
-`handle` is called once per request and must return a `Result` whose `data`
-matches the `output` your manifest declares for that outcome — exactly: every
-declared field present, nothing extra, right types. The runtime checks it and
-refuses anything that does not match, which is deliberate. An app that can
-return surprise fields is an app Pippa cannot describe to a user before they
-install it.
-
-Three things worth knowing before you start:
-
-**You get the inputs, and nothing about who asked.** No user id, no account,
-no conversation. `call.inputs` is what Pippa extracted from the message;
-besides it, `call.context` carries only the time, an id for your logs, and
-whether the person picked your app by name. This is on purpose: your app
-cannot leak what it was never given.
-
-**You keep nothing.** A fresh copy of this class is built for every call and
-thrown away afterwards. Writing to a file or a global will appear to work and
-then silently stop, because the next call may be on a different machine.
-
-**Errors are part of the design.** Raise `AgentAppError` with a `user_message`
-when you cannot answer. That message is the one a user may see; everything
-else — the exception type, the traceback — stays in the logs.
+Facts only. It never calls a walk "safe": it counts what police recorded in a
+named month, and works out sunset offline.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import json
+import math
+import re
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
 from pippa_agentapp_sdk import (
     AgentAppError,
     Call,
     Manifest,
+    RateLimitedError,
     Result,
+    ServiceUnavailableError,
     load_manifest_file,
     validate_manifest,
 )
 
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
+USER_AGENT = "pippa-agent-app-walkhomecheck/0.1 (https://github.com/Pippa-Labs)"
+LONDON = ZoneInfo("Europe/London")
+POSTCODE = re.compile(r"^[A-Za-z]{1,2}\d[A-Za-z\d]?(\s*\d[A-Za-z]{2})?$")
+MAX_WALK_KM = 6.0
+CORRIDOR_M = 120
+AREA_M = 400
+
+LABELS = {
+    "anti-social-behaviour": "anti-social behaviour",
+    "bicycle-theft": "bicycle theft",
+    "burglary": "burglary",
+    "criminal-damage-arson": "criminal damage and arson",
+    "drugs": "drugs",
+    "other-theft": "other theft",
+    "possession-of-weapons": "possession of weapons",
+    "public-order": "public order",
+    "robbery": "robbery",
+    "shoplifting": "shoplifting",
+    "theft-from-the-person": "theft from the person",
+    "vehicle-crime": "vehicle crime",
+    "violent-crime": "violence and sexual offences",
+    "other-crime": "other crime",
+}
+VIOLENT = {"violent-crime", "robbery"}
 
 
-class CannotReadDate(AgentAppError):
-    """Raised when the message did not contain a date we can work with."""
+class PlaceNotFound(AgentAppError):
+    user_message = "I could not find that place."
+    retryable = False
 
-    # What a user may be shown. Write it as a sentence, not an error code.
-    user_message = "I could not work out which date you meant."
+
+class NeedTwoPlaces(AgentAppError):
+    user_message = "Tell me where the walk starts and ends, for example: from Old Street to Angel."
+    retryable = False
+
+
+class NeedAPlace(AgentAppError):
+    user_message = "Tell me which place to check, for example a station, street or postcode."
+    retryable = False
+
+
+class WalkTooLong(AgentAppError):
+    user_message = "That walk is over 6 km, too long for me to check. Try a shorter stretch."
     retryable = False
 
 
 class App:
-    """A small, complete example: count the days until a date."""
-
     def __init__(self) -> None:
-        # Validated at construction, so an app whose manifest is wrong fails
-        # immediately and loudly rather than on some later call.
         self._manifest = validate_manifest(load_manifest_file(MANIFEST_PATH))
 
     @property
     def manifest(self) -> Manifest:
         return self._manifest
 
+    # ── network seam ──────────────────────────────────────────────────────
+    def _fetch(self, url: str, timeout: float = 6.0, headers: dict | None = None) -> bytes:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, **(headers or {})})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+
+    def _pause(self) -> None:
+        time.sleep(1.0)  # Nominatim allows one request a second
+
+    def _get_json(self, url: str, what: str, timeout: float = 6.0):
+        try:
+            raw = self._fetch(url, timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            if exc.code == 429:
+                raise RateLimitedError(f"{what} rate limited")
+            raise ServiceUnavailableError(f"{what} returned {exc.code}")
+        except TimeoutError as exc:
+            raise ServiceUnavailableError(f"{what} timed out: {exc}")
+        except urllib.error.URLError as exc:
+            raise ServiceUnavailableError(f"could not reach {what}: {exc.reason}")
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise ServiceUnavailableError(f"{what} sent something that is not JSON")
+
+    # ── geocoding ─────────────────────────────────────────────────────────
+    def _geocode(self, place: str, first: bool = True) -> tuple[float, float, str]:
+        text = " ".join(place.split())
+        if POSTCODE.match(text):
+            kind = "postcodes" if " " in text or len(text) > 4 else "outcodes"
+            data = self._get_json(
+                f"https://api.postcodes.io/{kind}/{quote(text, safe='')}", "postcodes.io", 4.0)
+            res = (data or {}).get("result")
+            if res and res.get("latitude") is not None:
+                return float(res["latitude"]), float(res["longitude"]), res.get("postcode") or res.get("outcode") or text.upper()
+        if not first:
+            self._pause()
+        for extra in ({"viewbox": "-0.52,51.70,0.34,51.28", "bounded": "1"}, {}):
+            query = {"q": text, "format": "json", "limit": "1", "countrycodes": "gb", **extra}
+            data = self._get_json("https://nominatim.openstreetmap.org/search?" + urlencode(query), "Nominatim", 5.0)
+            if data:
+                hit = data[0]
+                name = ", ".join(hit.get("display_name", text).split(", ")[:2])
+                return float(hit["lat"]), float(hit["lon"]), name
+            if not extra:
+                break
+            self._pause()
+        error = PlaceNotFound(f"no coordinates for {text!r}")
+        error.user_message = f"I could not find {text}. Try a station, street or postcode."
+        raise error
+
+    # ── police data ───────────────────────────────────────────────────────
+    def _month(self) -> str:
+        data = self._get_json("https://data.police.uk/api/crime-last-updated", "police.uk", 4.0)
+        return str((data or {}).get("date", ""))[:7]
+
+    def _crimes(self, points: list[tuple[float, float]], month: str) -> list[dict]:
+        poly = ":".join(f"{lat:.5f},{lon:.5f}" for lat, lon in points)
+        query = {"poly": poly}
+        if month:
+            query["date"] = month
+        data = self._get_json("https://data.police.uk/api/crimes-street/all-crime?" + urlencode(query), "police.uk", 8.0)
+        return data or []
+
+    @staticmethod
+    def _summarise(crimes: list[dict]) -> dict:
+        counts = Counter(c.get("category", "other-crime") for c in crimes)
+        top = ", ".join(f"{LABELS.get(k, k.replace('-', ' '))} {n}" for k, n in counts.most_common(3))
+        return {
+            "crimes_total": len(crimes),
+            "violence_and_robbery": sum(counts[k] for k in VIOLENT),
+            "theft_from_person": counts["theft-from-the-person"],
+            "top_categories": top or "none recorded",
+        }
+
+    # ── handle ────────────────────────────────────────────────────────────
     def handle(self, call: Call) -> Result:
-        """One request in, one Result out.
+        if call.outcome_id == "area.check":
+            return self._area(call)
+        return self._walk(call)
 
-        `call.outcome_id` says which of your manifest's outcomes was asked
-        for. With one outcome you can ignore it; with several, branch on it.
-        """
-        if call.outcome_id != "days.until":
-            raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
+    def _area(self, call: Call) -> Result:
+        place = (call.inputs.get("place") or "").strip()
+        if not place:
+            raise NeedAPlace("no place in the message")
+        lat, lon, name = self._geocode(place)
+        month = self._month()
+        dlat, dlon = _offsets(lat, AREA_M)
+        box = [(lat + dlat, lon - dlon), (lat + dlat, lon + dlon),
+               (lat - dlat, lon + dlon), (lat - dlat, lon - dlon)]
+        stats = self._summarise(self._crimes(box, month))
+        local = call.context.now.astimezone(LONDON)
+        sunrise, sunset = sun_times(lat, lon, local.date())
+        data = {"place_used": name, **stats, "month_used": month,
+                "radius_m": AREA_M, "sunset": sunset}
+        narrative = (f"Police recorded {stats['crimes_total']} street crimes within about "
+                     f"{AREA_M} m of {name} in {month}, {stats['violence_and_robbery']} of them "
+                     f"violence or robbery. Sunset there is {sunset}.")
+        return Result(data=data, narrative=narrative)
 
-        text = (call.inputs.get("date") or "").strip()
-        if not text:
-            # The manifest tells the extractor to send an empty string rather
-            # than guess, so this is the ordinary "they did not say" path.
-            #
-            # A missing or unreadable date (here, and in `_parse` below) is
-            # the only thing this app refuses for, which is why it never reads
-            # `call.context.explicit`, True when the person picked the app
-            # with @. That refusal is right whoever chose the app; the test
-            # that says so is in test_app.py.
-            raise CannotReadDate("no date in the message")
+    def _walk(self, call: Call) -> Result:
+        start = (call.inputs.get("from_place") or "").strip()
+        end = (call.inputs.get("to_place") or "").strip()
+        if not start or not end:
+            raise NeedTwoPlaces(f"from={start!r} to={end!r}")
+        a_lat, a_lon, a_name = self._geocode(start)
+        b_lat, b_lon, b_name = self._geocode(end, first=False)
+        km = haversine_km(a_lat, a_lon, b_lat, b_lon)
+        if km > MAX_WALK_KM:
+            raise WalkTooLong(f"{km:.1f} km")
+        route_km = km * 1.3
+        minutes = max(1, round(route_km / 5.0 * 60))
 
-        # `call.context.now` is the current time, supplied by the runtime
-        # rather than read from the clock. That is what makes an app testable:
-        # a test can say what "now" is.
-        today = self._today(call)
-        target = self._parse(text, today)
-        difference = (target - today).days
+        local = call.context.now.astimezone(LONDON)
+        walk_at = local
+        match = re.match(r"^\s*(\d{1,2})[:.](\d{2})\s*$", call.inputs.get("time") or "")
+        if match and int(match.group(1)) < 24 and int(match.group(2)) < 60:
+            walk_at = local.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0, microsecond=0)
+            if walk_at < local - timedelta(hours=2):
+                walk_at += timedelta(days=1)
+        sunrise, sunset = sun_times(a_lat, a_lon, walk_at.date())
+        clock = walk_at.strftime("%H:%M")
+        dark = not (sunrise <= clock < sunset)
 
-        return Result(
-            data={
-                "days": abs(difference),
-                "target_date": target.isoformat(),
-                "weekday": target.strftime("%A"),
-                "already_passed": difference < 0,
-            },
-            # Optional. One plain sentence Pippa may use when it writes its
-            # reply. Say what you found, not what you did.
-            narrative=self._sentence(target, difference),
-        )
+        month = self._month()
+        stats = self._summarise(self._crimes(corridor(a_lat, a_lon, b_lat, b_lon, CORRIDOR_M), month))
+        data = {"from_used": a_name, "to_used": b_name, "distance_km": round(route_km, 2),
+                "walk_minutes": minutes, **stats, "month_used": month, "walk_time": clock,
+                "dark": dark, "sunset": sunset, "sunrise": sunrise}
+        light = "in the dark" if dark else "in daylight"
+        narrative = (f"About {minutes} minutes ({route_km:.1f} km) from {a_name} to {b_name}, "
+                     f"{light} at {clock} (sunset {sunset}). Police recorded "
+                     f"{stats['crimes_total']} street crimes along that line in {month}, "
+                     f"{stats['violence_and_robbery']} violence or robbery and "
+                     f"{stats['theft_from_person']} theft from the person.")
+        return Result(data=data, narrative=narrative)
 
-    @staticmethod
-    def _today(call: Call) -> date:
-        """The user's today, not the server's.
 
-        A server in UTC and a user in Auckland disagree about what day it is
-        for twelve hours out of every twenty-four, and "how many days until"
-        is exactly the question that notices.
-        """
-        # No try/except around ZoneInfo, and that is the point: the manifest
-        # declares this input as `type: timezone`, so the runtime has already
-        # rejected anything that is not a real IANA zone before your code
-        # runs. Declaring the right type is cheaper than validating by hand,
-        # and the user gets a better error.
-        zone = call.inputs.get("timezone")
-        moment: datetime = call.context.now
-        if zone:
-            moment = moment.astimezone(ZoneInfo(zone))
-        return moment.date()
+# ── geometry and sun ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _parse(text: str, today: date) -> date:
-        """Turn what the user wrote into a date.
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(h))
 
-        Deliberately small — real date parsing is its own project. Handles
-        `YYYY-MM-DD`, `25 December`, `December 25` and a bare day number.
-        """
-        cleaned = text.replace(",", " ").strip()
 
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
+def _offsets(lat: float, metres: float) -> tuple[float, float]:
+    return metres / 111_320.0, metres / (111_320.0 * math.cos(math.radians(lat)))
 
-        for fmt in ("%d %B", "%B %d", "%d %b", "%b %d"):
-            try:
-                parsed = datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-            # A bare day and month has no year. "25 December" asked in
-            # February means this year; asked in December means this year too,
-            # until it has passed, and then it means next year.
-            candidate = parsed.replace(year=today.year)
-            if candidate < today:
-                candidate = candidate.replace(year=today.year + 1)
-            return candidate
 
-        if cleaned.lower() == "tomorrow":
-            return today + timedelta(days=1)
+def corridor(a_lat, a_lon, b_lat, b_lon, half_width_m):
+    """A rectangle of half_width_m either side of the straight line A to B."""
+    k = 111_320.0 * math.cos(math.radians((a_lat + b_lat) / 2))
+    ax, ay, bx, by = a_lon * k, a_lat * 111_320.0, b_lon * k, b_lat * 111_320.0
+    dx, dy = bx - ax, by - ay
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy * half_width_m, ux * half_width_m
+    ex, ey = ux * half_width_m, uy * half_width_m
+    corners = [(ax - ex + nx, ay - ey + ny), (bx + ex + nx, by + ey + ny),
+               (bx + ex - nx, by + ey - ny), (ax - ex - nx, ay - ey - ny)]
+    return [(y / 111_320.0, x / k) for x, y in corners]
 
-        raise CannotReadDate(f"could not parse {text!r} as a date")
 
-    @staticmethod
-    def _sentence(target: date, difference: int) -> str:
-        # Built by hand rather than with `%-d`, which is a GNU extension: it
-        # raises ValueError on Windows, where half of you are developing, and
-        # the failure would only show up at the last line of a working app.
-        pretty = (
-            f"{target.strftime('%A')} {target.day} "
-            f"{target.strftime('%B')} {target.year}"
-        )
-        if difference == 0:
-            return f"That is today, {pretty}."
-        if difference < 0:
-            return f"{pretty} was {abs(difference)} days ago."
-        if difference == 1:
-            return f"{pretty} is tomorrow."
-        return f"There are {difference} days until {pretty}."
+def sun_times(lat: float, lon: float, day) -> tuple[str, str]:
+    """Sunrise and sunset, HH:MM UK time, from the NOAA approximation."""
+    n = day.timetuple().tm_yday
+    g = 2 * math.pi / 365 * (n - 1)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                       - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g) - 0.006758 * math.cos(2 * g)
+            + 0.000907 * math.sin(2 * g) - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+    phi = math.radians(lat)
+    cos_ha = math.cos(math.radians(90.833)) / (math.cos(phi) * math.cos(decl)) - math.tan(phi) * math.tan(decl)
+    ha = math.degrees(math.acos(max(-1.0, min(1.0, cos_ha))))
+    midnight = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+    def clock(minutes: float) -> str:
+        return (midnight + timedelta(minutes=minutes)).astimezone(LONDON).strftime("%H:%M")
+
+    return clock(720 - 4 * (lon + ha) - eqtime), clock(720 - 4 * (lon - ha) - eqtime)
