@@ -93,9 +93,9 @@ class App:
     def _pause(self) -> None:
         time.sleep(1.0)  # Nominatim allows one request a second
 
-    def _get_json(self, url: str, what: str, timeout: float = 6.0):
+    def _get_json(self, url: str, what: str, timeout: float = 6.0, headers: dict | None = None):
         try:
-            raw = self._fetch(url, timeout)
+            raw = self._fetch(url, timeout, headers)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return None
@@ -150,6 +150,31 @@ class App:
         data = self._get_json("https://data.police.uk/api/crimes-street/all-crime?" + urlencode(query), "police.uk", 8.0)
         return data or []
 
+    def _venues(self, lat: float, lon: float, miles: float) -> list[tuple[float, float]] | None:
+        """Pubs, bars, clubs and takeaways from the FSA register: where people are.
+
+        Best-effort: None if the register cannot be reached, and the answer
+        goes out without a venue count.
+        """
+        found: dict[str, tuple[float, float]] = {}
+        for business_type in ("7843", "7844"):
+            query = {"latitude": f"{lat:.5f}", "longitude": f"{lon:.5f}",
+                     "maxDistanceLimit": f"{miles:.2f}", "businessTypeId": business_type,
+                     "pageSize": "1000"}
+            try:
+                data = self._get_json(
+                    "https://api.ratings.food.gov.uk/Establishments?" + urlencode(query),
+                    "FSA", 4.0, {"x-api-version": "2", "Accept": "application/json"})
+            except AgentAppError:
+                return None
+            for e in (data or {}).get("establishments") or []:
+                g = e.get("geocode") or {}
+                try:
+                    found[str(e.get("FHRSID"))] = (float(g["latitude"]), float(g["longitude"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return list(found.values())
+
     @staticmethod
     def _summarise(crimes: list[dict]) -> dict:
         counts = Counter(c.get("category", "other-crime") for c in crimes)
@@ -179,11 +204,17 @@ class App:
         stats = self._summarise(self._crimes(box, month))
         local = call.context.now.astimezone(LONDON)
         sunrise, sunset = sun_times(lat, lon, local.date())
+        venues = self._venues(lat, lon, AREA_M / 1609 + 0.05)
+        count = None if venues is None else sum(
+            1 for v in venues if haversine_km(lat, lon, v[0], v[1]) * 1000 <= AREA_M)
+        busy = busyness(count, local.hour, busy_at=20, some_at=6)
         data = {"place_used": name, **stats, "month_used": month,
-                "radius_m": AREA_M, "sunset": sunset}
+                "radius_m": AREA_M, "sunset": sunset, "busyness": busy}
+        if count is not None:
+            data["late_venues"] = count
         narrative = (f"Police recorded {stats['crimes_total']} street crimes within about "
                      f"{AREA_M} m of {name} in {month}, {stats['violence_and_robbery']} of them "
-                     f"violence or robbery. Sunset there is {sunset}.")
+                     f"violence or robbery. Right now it is {busy}. Sunset there is {sunset}.")
         return Result(data=data, narrative=narrative)
 
     def _walk(self, call: Call) -> Result:
@@ -212,15 +243,23 @@ class App:
 
         month = self._month()
         stats = self._summarise(self._crimes(corridor(a_lat, a_lon, b_lat, b_lon, CORRIDOR_M), month))
+        venues = self._venues((a_lat + b_lat) / 2, (a_lon + b_lon) / 2, min(2.0, km / 2 / 1.609 + 0.1))
+        count = None if venues is None else sum(
+            1 for v in venues if dist_to_line_m(v[0], v[1], [(a_lat, a_lon), (b_lat, b_lon)]) <= CORRIDOR_M)
+        per_km = max(route_km, 0.1)
+        busy = busyness(count, walk_at.hour, busy_at=8 * per_km, some_at=3 * per_km)
         data = {"from_used": a_name, "to_used": b_name, "distance_km": round(route_km, 2),
                 "walk_minutes": minutes, **stats, "month_used": month, "walk_time": clock,
-                "dark": dark, "sunset": sunset, "sunrise": sunrise}
+                "dark": dark, "sunset": sunset, "sunrise": sunrise, "busyness": busy}
+        if count is not None:
+            data["late_venues"] = count
         light = "in the dark" if dark else "in daylight"
         narrative = (f"About {minutes} minutes ({route_km:.1f} km) from {a_name} to {b_name}, "
                      f"{light} at {clock} (sunset {sunset}). Police recorded "
                      f"{stats['crimes_total']} street crimes along that line in {month}, "
                      f"{stats['violence_and_robbery']} violence or robbery and "
-                     f"{stats['theft_from_person']} theft from the person.")
+                     f"{stats['theft_from_person']} theft from the person. At that hour the "
+                     f"route is {busy}.")
         return Result(data=data, narrative=narrative)
 
 
@@ -268,3 +307,35 @@ def sun_times(lat: float, lon: float, day) -> tuple[str, str]:
         return (midnight + timedelta(minutes=minutes)).astimezone(LONDON).strftime("%H:%M")
 
     return clock(720 - 4 * (lon + ha) - eqtime), clock(720 - 4 * (lon - ha) - eqtime)
+
+
+def _xy(lat: float, lon: float, lat0: float) -> tuple[float, float]:
+    return lon * 111_320.0 * math.cos(math.radians(lat0)), lat * 111_320.0
+
+
+def dist_to_line_m(lat: float, lon: float, coords: list[tuple[float, float]]) -> float:
+    """Shortest distance in metres from a point to a polyline."""
+    px, py = _xy(lat, lon, lat)
+    pts = [_xy(a, b, lat) for a, b in coords]
+    best = float("inf")
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        dx, dy = x2 - x1, y2 - y1
+        seg = dx * dx + dy * dy
+        t = 0.0 if seg == 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / seg))
+        best = min(best, math.hypot(px - (x1 + t * dx), py - (y1 + t * dy)))
+    return best
+
+
+def busyness(venues: int | None, hour: int, busy_at: float, some_at: float) -> str:
+    """How many people are likely about, from late venues and the hour."""
+    if 1 <= hour < 6:
+        return "likely quiet: most pubs and takeaways are shut at that hour"
+    if venues is None:
+        return "busyness unknown"
+    if venues >= busy_at:
+        level = "busy"
+    elif venues >= some_at:
+        level = "fairly busy"
+    else:
+        level = "quiet"
+    return f"{level} ({venues} pubs, bars and takeaways)"

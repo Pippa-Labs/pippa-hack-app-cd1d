@@ -6,11 +6,11 @@ app_author_name: "Nightingale"
 app:
   id: hack.app_cd1d
   name: Streetwise
-  version: 0.1.1
+  version: 0.1.2
   summary: >-
     Checks your walk home at night: the street crimes police recorded along
-    your route or around a place, and the light level when you walk, from
-    daylight to dark.
+    your route or around a place, how busy the streets are, and the light
+    level when you walk, from daylight to dark.
 
 agent_types:
   - personal
@@ -26,6 +26,7 @@ outcomes:
       - how risky is walking from oval to kennington
       - check my route home from the tube at midnight
       - walking back from a night out how risky
+      - how busy is my walk home from the pub
     inputs:
       - name: from_place
         type: string
@@ -88,6 +89,13 @@ outcomes:
       - name: sunrise
         type: string
         description: Sunrise at the start of the walk, HH:MM UK time.
+      - name: busyness
+        type: string
+        description: How busy the route is likely to be at the walk time, from the late venues along it and the hour.
+      - name: late_venues
+        type: integer
+        required: false
+        description: Pubs, bars, clubs and takeaways along the route, from the Food Standards Agency register.
 
   - id: area.check
     summary: Recorded street crime within about 400 metres of one place, and when it gets dark there
@@ -98,6 +106,7 @@ outcomes:
       - how much street crime is there in brixton
       - is it rough round elephant and castle
       - crime rate near my hotel in camden
+      - is it busy round shoreditch high street
     inputs:
       - name: place
         type: string
@@ -131,3 +140,10 @@ outcomes:
       - name: sunset
         type: string
         description: Sunset at the place, HH:MM UK time.
+      - name: busyness
+        type: string
+        description: How busy the place is likely to be now, from the late venues there and the hour.
+      - name: late_venues
+        type: integer
+        required: false
+        description: Pubs, bars, clubs and takeaways within the radius, from the Food Standards Agency register.

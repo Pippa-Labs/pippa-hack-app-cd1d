@@ -19,6 +19,12 @@ PLACES = {
     "brixton": ("51.4613", "-0.1156", "Brixton, London"),
     "manchester": ("53.4808", "-2.2426", "Manchester, England"),
 }
+VENUES = {"establishments": [
+    {"FHRSID": 1, "geocode": {"latitude": "51.5289", "longitude": "-0.09665"}},   # on the Old Street to Angel line
+    {"FHRSID": 2, "geocode": {"latitude": "51.5290", "longitude": "-0.0967"}},
+    {"FHRSID": 3, "geocode": {"latitude": "51.4614", "longitude": "-0.1157"}},    # Brixton
+    {"FHRSID": 4, "geocode": None},
+]}
 CRIMES = [
     {"category": "violent-crime"}, {"category": "violent-crime"},
     {"category": "robbery"}, {"category": "theft-from-the-person"},
@@ -32,6 +38,9 @@ def fake_fetch(crimes=CRIMES):
             return b'{"date": "2026-09-01"}'
         if "crimes-street" in url:
             return json.dumps(crimes).encode()
+        if "ratings.food.gov.uk" in url:
+            assert headers and headers.get("x-api-version") == "2"
+            return json.dumps(VENUES).encode()
         if "postcodes.io" in url:
             return json.dumps({"result": {"latitude": 51.546, "longitude": -0.075, "postcode": "E8 3PH"}}).encode()
         if "nominatim" in url:
@@ -141,3 +150,34 @@ def test_sunset_in_november_london():
     sunrise, sunset = sun_times(51.4988, -0.1749, NOW.date())
     assert sunset.startswith("16:0")
     assert sunrise.startswith("07:2")
+
+
+def test_busyness_counts_late_venues_along_the_walk():
+    r = call({"from_place": "Old Street", "to_place": "Angel", "time": "21:00"})
+    assert r.data["late_venues"] == 2
+    assert r.data["busyness"] == "quiet (2 pubs, bars and takeaways)"
+    assert "quiet (2 pubs" in r.narrative
+
+
+def test_busyness_in_the_small_hours_is_quiet():
+    r = call({"from_place": "Old Street", "to_place": "Angel", "time": "03:00"})
+    assert r.data["busyness"].startswith("likely quiet")
+
+
+def test_busyness_around_a_place():
+    r = call({"place": "Brixton"}, "area.check")
+    assert r.data["late_venues"] == 1
+
+
+def test_venue_register_down_still_answers():
+    base = fake_fetch()
+
+    def fetch(url, timeout=6.0, headers=None):
+        if "ratings.food.gov.uk" in url:
+            raise urllib.error.HTTPError(url, 503, "down", {}, None)
+        return base(url, timeout, headers)
+
+    r = call({"place": "Brixton"}, "area.check", app=make(fetch))
+    assert "late_venues" not in r.data
+    assert r.data["busyness"] == "busyness unknown"
+    assert r.data["crimes_total"] == 5
