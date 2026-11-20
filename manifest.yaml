@@ -8,8 +8,9 @@ app:
   name: Streetwise
   version: 0.1.0
   summary: >-
-    Checks your walk home at night: counts the street crimes police recorded
-    along your route or around a place, and says whether it will be dark.
+    Checks your walk home at night: the street crimes police recorded along
+    your route or around a place, and the light level when you walk, from
+    daylight to dark.
 
 agent_types:
   - personal
